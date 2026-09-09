@@ -80,6 +80,13 @@ PLATFORM_VENV_HOOK=""
 # ERE matching lines to drop from embodied/envs/common.txt, for platforms where
 # some of those wheels are unusable. Set by configure_<platform>.
 PLATFORM_COMMON_REQ_EXCLUDE_RE=""
+# Set to 1 by configure_amd when the base image already ships a ROCm torch that
+# must be preserved. Read by install_amd_extras and the venv bridge.
+AMD_REUSE_IMAGE_TORCH=0
+# Absolute path to the image interpreter and its site-packages, captured before
+# any venv is activated. Used by bridge_image_site_packages.
+IMAGE_PYTHON=""
+IMAGE_SITE_PACKAGES=""
 # Default torch-backend per platform; user can override by exporting
 # UV_TORCH_BACKEND before invoking this script.
 DEFAULT_BACKEND_NVIDIA="auto"
@@ -555,6 +562,28 @@ configure_nvidia() {
     fi
 }
 
+# Vendor ROCm images (e.g. amdagi/verl-dev, rocm/pytorch) ship a custom torch
+# build plus kernels compiled against it (apex, flash-attn, triton, vllm). Their
+# local version tag carries the ROCm marker, e.g. 2.12.0+rocm7.14.0a20260608.
+# Reinstalling torch from the public wheel index swaps the ABI out from under
+# those kernels, so detect this case and reuse what the image already has.
+# Metadata only: importing torch needs a device and would fail in a docker build.
+detect_image_rocm_torch() {
+    python - <<'EOF' 2>/dev/null
+import importlib.metadata as metadata
+import sys
+
+try:
+    version = metadata.version("torch")
+except metadata.PackageNotFoundError:
+    sys.exit(1)
+if "rocm" in version or "hip" in version:
+    print(version)
+else:
+    sys.exit(1)
+EOF
+}
+
 configure_amd() {
     if [ -z "$ROCM_VERSION" ]; then
         ROCM_VERSION=$(detect_rocm_version) || {
@@ -567,6 +596,16 @@ configure_amd() {
     if [[ ! "$ROCM_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
         echo "--rocm must be of form X.Y or X.Y.Z (got '$ROCM_VERSION')." >&2
         exit 1
+    fi
+
+    # Reuse the image's ROCm torch unless the caller pinned one with --torch.
+    local image_torch=""
+    if [ -z "$TORCH_VERSION" ]; then
+        image_torch=$(detect_image_rocm_torch || true)
+    fi
+    if [ -n "$image_torch" ]; then
+        configure_amd_reuse_image_torch "$image_torch"
+        return 0
     fi
 
     if [ -z "$TORCH_VERSION" ]; then
@@ -590,11 +629,7 @@ configure_amd() {
     # deps in [project.dependencies] so [tool.uv.sources] mappings actually
     # take effect (uv only applies sources to direct deps).
     PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio" "pytorch-triton-rocm" "triton-rocm")
-    PLATFORM_VENV_EXPORTS=(
-        "export AMD_VULKAN_ICD=RADV"
-        "export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
-        "export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
-    )
+    set_amd_venv_exports
     PLATFORM_FLASH_ATTN_INSTALL=1
     PLATFORM_FLASH_ATTN_PREBUILT=0
     PLATFORM_RELAX_TORCHCODEC=1
@@ -606,6 +641,215 @@ configure_amd() {
     PLATFORM_COMMON_REQ_EXCLUDE_RE=""
     if [ -z "${UV_TORCH_BACKEND:-}" ]; then
         export UV_TORCH_BACKEND="rocm${ROCM_VERSION}"
+    fi
+}
+
+# RADV is the right ICD for Radeon graphics parts, but it rejects CDNA
+# accelerators ("device 'GFX940' is not supported by RADV"), leaving Vulkan with
+# no devices at all. AMD_VULKAN_ICD_FILE lets the image (or the caller) point at
+# a working ICD instead — e.g. lavapipe's lvp_icd.json on MI300/MI350.
+set_amd_venv_exports() {
+    local icd="${AMD_VULKAN_ICD_FILE:-}"
+    if [ -n "$icd" ]; then
+        PLATFORM_VENV_EXPORTS=(
+            "export VK_DRIVER_FILES=${icd}"
+            "export VK_ICD_FILENAMES=${icd}"
+        )
+        echo "[install.sh] amd: Vulkan ICD pinned to ${icd}"
+    else
+        PLATFORM_VENV_EXPORTS=(
+            "export AMD_VULKAN_ICD=RADV"
+            "export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
+            "export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
+        )
+    fi
+}
+
+# The image already provides torch (and usually flash-attn/triton/apex built
+# against it). Resolve those packages but never install them, and bridge the
+# image's site-packages into each venv, so the vendor build stays intact.
+configure_amd_reuse_image_torch() {
+    local image_torch="$1"
+    echo "[install.sh] amd: reusing the image's torch==${image_torch}; skipping the ROCm wheel index."
+
+    # Reuse the image interpreter: the vendor torch is built for exactly this
+    # ABI tag, and a uv-managed interpreter would not see it.
+    if [ "$USER_SET_PYTHON" -eq 0 ]; then
+        PYTHON_VERSION=$(python - <<'EOF'
+import sys
+print("%d.%d.%d" % sys.version_info[:3])
+EOF
+)
+        echo "[install.sh] amd: reusing the image interpreter, python ${PYTHON_VERSION}"
+        validate_python_version
+    fi
+    export UV_PYTHON_PREFERENCE="${UV_PYTHON_PREFERENCE:-only-system}"
+
+    # Pin resolution to the image's torch version, with no local +rocm tag: the
+    # vendor tag (e.g. +rocm7.14.0a20260608) exists on no public index.
+    TORCH_VERSION="${image_torch%%+*}"
+    PLATFORM_TORCH_STR=""
+    # torch is resolved but never installed; the CPU index keeps the multi-GB
+    # nvidia-* CUDA wheels out of the resolution.
+    if [ "$USE_MIRRORS" -eq 1 ]; then
+        PLATFORM_TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/cpu"
+    else
+        PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+    fi
+    PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio")
+    # Deliberately leave UV_TORCH_BACKEND unset. Forcing it to "cpu" makes uv
+    # resolve torch==X+cpu, which does not match the seeded X+rocm... local
+    # version, so it would reinstall torch and clobber the vendor build. With no
+    # backend the seeded metadata satisfies every plain `torch` requirement; the
+    # CUDA wheels that torch's PyPI metadata drags in behind it (lerobot pulls 15)
+    # are swept in install_amd_extras.
+    AMD_REUSE_IMAGE_TORCH=1
+
+    set_amd_venv_exports
+    # flash-attn/apex/triton in these images are ROCm source builds pinned to the
+    # vendor torch; rebuilding them is slow and would link against the wrong ABI.
+    PLATFORM_FLASH_ATTN_INSTALL=0
+    PLATFORM_FLASH_ATTN_PREBUILT=0
+    PLATFORM_RELAX_TORCHCODEC=1
+    PLATFORM_TORCHCODEC_SPEC=""
+    PLATFORM_EXTRA_OVERRIDES=()
+
+    PLATFORM_UV_SYNC_ARGS=("--inexact")
+    local pkg
+    for pkg in torch torchvision torchaudio torchcodec triton pytorch-triton-rocm \
+        flash-attn deepspeed vllm sglang xgrammar liger-kernel transformer-engine \
+        torch-memory-saver apex ray; do
+        PLATFORM_UV_SYNC_ARGS+=("--no-install-package" "$pkg")
+    done
+
+    # uv resolves nvidia-* wheels happily on x86_64 and they drag a CUDA torch
+    # in behind them.
+    PLATFORM_COMMON_REQ_EXCLUDE_RE='^[[:space:]]*nvidia-'
+    # /opt/venv is itself a venv on these images, so --system-site-packages would
+    # inherit /usr/lib/python3/dist-packages instead. Bridge explicitly.
+    PLATFORM_SYSTEM_SITE_PACKAGES=0
+    PLATFORM_VENV_HOOK=bridge_image_site_packages
+
+    # Record the image interpreter now: create_and_sync_venv activates the new
+    # venv before it calls PLATFORM_VENV_HOOK, so by then `python` is the venv's
+    # and can no longer see the image's site-packages.
+    IMAGE_PYTHON="$(command -v python)"
+    IMAGE_SITE_PACKAGES="$("$IMAGE_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    echo "[install.sh] amd: image site-packages at ${IMAGE_SITE_PACKAGES}"
+}
+
+# Two-part bridge into the image's site-packages:
+#   1. a .pth so `import torch` resolves at runtime. It sorts last so packages
+#      installed into the venv still shadow the image's copies.
+#   2. dist-info metadata (never the files, and with an empty RECORD so an
+#      uninstall cannot delete the originals) so `uv pip install` believes these
+#      are present and does not pull a CUDA build in behind them.
+bridge_image_site_packages() {
+    # Absolute: UV_CONSTRAINT outlives this function and later steps (repo clones,
+    # editable installs) change directory.
+    local constraints
+    constraints="$(cd "$VENV_DIR" && pwd)/rlinf-image-constraints.txt"
+    # Run under the *image* interpreter: the venv is already active here, and its
+    # python cannot see the image's torch.
+    VENV_DIR="$VENV_DIR" IMAGE_SITE_PACKAGES="$IMAGE_SITE_PACKAGES" \
+        RLINF_CONSTRAINTS="$constraints" "$IMAGE_PYTHON" - <<'EOF'
+import importlib.metadata as metadata
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+venv_python = pathlib.Path(os.environ["VENV_DIR"]) / "bin" / "python"
+venv_site = pathlib.Path(
+    subprocess.run(
+        [str(venv_python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+)
+image_site = pathlib.Path(os.environ["IMAGE_SITE_PACKAGES"])
+
+if image_site == venv_site:
+    print("[install.sh] amd: venv is the image environment; nothing to bridge", file=sys.stderr)
+    sys.exit(0)
+
+# Mirror every image sys.path entry that lives under its site-packages, not just
+# site-packages itself: legacy easy_install eggs (the AMD images ship flash-attn
+# that way) sit one level deeper and are only reachable via easy-install.pth.
+# "zzz-" so the file sorts after the venv's own .pth files.
+entries = [image_site]
+for entry in sys.path:
+    if not entry:
+        continue
+    candidate = pathlib.Path(entry)
+    if candidate in entries or not candidate.is_dir():
+        continue
+    if candidate.is_relative_to(image_site):
+        entries.append(candidate)
+
+(venv_site / "zzz-rlinf-image-site-packages.pth").write_text(
+    "".join(f"{entry}\n" for entry in entries)
+)
+for entry in entries:
+    print(f"[install.sh] amd: bridged {entry} into {venv_site}", file=sys.stderr)
+
+KEEP = ("WHEEL", "INSTALLER", "top_level.txt", "entry_points.txt")
+# The vendor torch declares requirements that live only in AMD's internal index
+# (rocm[libraries]==7.14.0a..., amd-torch-device-gfx942, ...). Keeping them makes
+# every resolution that touches torch unsatisfiable, so drop the dependency
+# fields from the bridged copy: everything torch needs is already in the image.
+DROP_FIELDS = ("Requires-Dist:", "Provides-Extra:")
+
+pins = []
+
+for name in (
+    "torch", "torchvision", "torchaudio", "triton", "pytorch-triton-rocm",
+    "flash_attn", "apex",
+):
+    try:
+        dist = metadata.distribution(name)
+    except metadata.PackageNotFoundError:
+        continue
+    root = pathlib.Path(dist.locate_file(""))
+    matches = [
+        d
+        for variant in {name, name.replace("_", "-"), name.replace("-", "_")}
+        for d in root.glob(f"{variant}-{dist.version}.dist-info")
+        if d.is_dir()
+    ]
+    if matches and matches[0].parent == venv_site:
+        continue  # already the venv's own copy
+    dist_name = dist.metadata["Name"]
+    dst = venv_site / f"{dist_name.replace('-', '_')}-{dist.version}.dist-info"
+    shutil.rmtree(dst, ignore_errors=True)
+    dst.mkdir(parents=True)
+    if matches:
+        for meta in KEEP:
+            if (matches[0] / meta).is_file():
+                shutil.copy2(matches[0] / meta, dst / meta)
+        lines = (matches[0] / "METADATA").read_text(errors="replace").splitlines()
+        kept = [ln for ln in lines if not ln.startswith(DROP_FIELDS)]
+        (dst / "METADATA").write_text("\n".join(kept) + "\n")
+    else:
+        # Egg-installed (or otherwise non-wheel) dists have no .dist-info to
+        # copy, so synthesise the minimum uv needs to treat them as installed.
+        (dst / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {dist_name}\nVersion: {dist.version}\n"
+        )
+        (dst / "INSTALLER").write_text("rlinf-image-bridge\n")
+    (dst / "RECORD").write_text("")
+    pins.append(f"{dist_name}=={dist.version}")
+    print(f"[install.sh] amd: reusing the image's {name}=={dist.version}", file=sys.stderr)
+
+# Constraints keep `uv pip install` from resolving a newer (CUDA) torch: lerobot,
+# for one, otherwise downgrades torch 2.12.0+rocm... to a 2.11.0 CUDA wheel.
+pathlib.Path(os.environ["RLINF_CONSTRAINTS"]).write_text("".join(f"{p}\n" for p in pins))
+EOF
+    if [ -s "$constraints" ]; then
+        export UV_CONSTRAINT="$constraints"
+        echo "[install.sh] amd: pinning image packages via UV_CONSTRAINT=${constraints}"
     fi
 }
 
@@ -837,6 +1081,30 @@ install_nvidia_extras() {
 }
 
 install_amd_extras() {
+    if [ "${AMD_REUSE_IMAGE_TORCH:-0}" -eq 1 ]; then
+        # torch's PyPI metadata declares the nvidia-* CUDA runtime as
+        # dependencies, so anything depending on torch (lerobot pulls 15 of them)
+        # drags them in even though torch itself is never reinstalled. They are
+        # dead weight next to a ROCm build. Sweep by prefix, as the musa path
+        # does; nvidia-ml-py is a pure-python NVML binding others import
+        # defensively, so keep it.
+        local cuda_pkgs
+        cuda_pkgs=$(uv pip list --format json 2>/dev/null \
+            | grep -oE '"name":"[^"]+"' \
+            | sed -e 's/^"name":"//' -e 's/"$//' \
+            | grep -E '^(nvidia|cuda)[-_]' \
+            | grep -vx 'nvidia-ml-py' \
+            | tr '\n' ' ' || true)
+        if [ -n "$cuda_pkgs" ]; then
+            echo "[install.sh] amd: removing CUDA-only wheels: ${cuda_pkgs}"
+            # shellcheck disable=SC2086
+            uv pip uninstall $cuda_pkgs || true
+        fi
+        # The image already provides a `triton` importable on ROCm; the shim
+        # install below keys off pytorch-triton-rocm, which these images do not use.
+        return 0
+    fi
+
     # Some downstream packages (vllm and friends) import `triton` directly even
     # when running on ROCm. pytorch-triton-rocm provides the ROCm runtime but
     # is not importable as `triton`, so install the `triton` shim package at
@@ -2178,7 +2446,24 @@ install_lingbot_vla_model() {
     uv pip install -e $lingbotvla_dir/lingbotvla/models/vla/vision_models/MoGe --no-deps
 
     install_lerobot
-    env -u UV_TORCH_BACKEND uv pip install -r $SCRIPT_DIR/embodied/models/lingbotvla.txt
+    if [ "$PLATFORM" = "nvidia" ]; then
+        env -u UV_TORCH_BACKEND uv pip install -r $SCRIPT_DIR/embodied/models/lingbotvla.txt
+    else
+        # Three pins in that file are CUDA/py3.11 artefacts that are unused on the
+        # RoboTwin path:
+        #   xformers==0.0.28.post3 -- resolves to torch==2.5.1 + nvidia-cuda-*, which
+        #     would replace a ROCm torch. lingbot-vla's only reference is a
+        #     commented-out import (models/vla/pi0/utils.py).
+        #   tensorflow / tensorflow-datasets -- 2.15.0 has no cp312 wheel. TF is a
+        #     lazy guarded import (rlinf/envs/utils.py) reached only via
+        #     center_crop_image, and the robotwin configs set center_crop: false.
+        #   sapien==3.0.0.b1 -- cannot create a render device (it requires
+        #     VK_KHR_external_semaphore_fd); common.txt's 3.0.1 works.
+        echo "[install.sh] ${PLATFORM}: installing lingbotvla requirements without xformers/tensorflow/sapien pins"
+        grep -Ev '^[[:space:]]*(xformers|tensorflow|tensorflow-datasets|sapien)([<>=!]|$)' \
+            "$SCRIPT_DIR/embodied/models/lingbotvla.txt" \
+            | env -u UV_TORCH_BACKEND uv pip install -r -
+    fi
 
     case "$ENV_NAME" in
         robotwin)
@@ -2802,26 +3087,39 @@ install_xsquare_turtle2_env() {
 }
 
 install_robotwin_env() {
-    # Set TORCH_CUDA_ARCH_LIST based on the CUDA version
     local cuda_mm cuda_major cuda_minor
-    cuda_mm=$(detect_cuda_major_minor) || {
-        echo "Could not detect CUDA version. Cannot build robotwin environment." >&2
-        exit 1
-    }
-    cuda_major="${cuda_mm%% *}"
-    cuda_minor="${cuda_mm##* }"
-    if [ "$cuda_major" -gt 12 ] || { [ "$cuda_major" -eq 12 ] && [ "$cuda_minor" -ge 8 ]; }; then
-        # Include Blackwell support for CUDA 12.8+
-        export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0;10.0"
-    else
-        export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0"
+    if [ "$PLATFORM" = "nvidia" ]; then
+        # Set TORCH_CUDA_ARCH_LIST based on the CUDA version
+        cuda_mm=$(detect_cuda_major_minor) || {
+            echo "Could not detect CUDA version. Cannot build robotwin environment." >&2
+            exit 1
+        }
+        cuda_major="${cuda_mm%% *}"
+        cuda_minor="${cuda_mm##* }"
+        if [ "$cuda_major" -gt 12 ] || { [ "$cuda_major" -eq 12 ] && [ "$cuda_minor" -ge 8 ]; }; then
+            # Include Blackwell support for CUDA 12.8+
+            export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0;10.0"
+        else
+            export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0"
+        fi
     fi
 
-    uv pip install mplib==0.2.1 gymnasium==0.29.1 av open3d zarr openai
+    # zarr is declared by RoboTwin but never imported; skip it off NVIDIA.
+    uv pip install mplib==0.2.1 gymnasium==0.29.1 av open3d openai
 
-    uv pip install git+${GITHUB_PREFIX}https://github.com/facebookresearch/pytorch3d.git@v0.7.9  --no-build-isolation
-    uv pip install warp-lang==1.11.1
-    uv pip install git+${GITHUB_PREFIX}https://github.com/NVlabs/curobo.git  --no-build-isolation
+    if [ "$PLATFORM" = "nvidia" ]; then
+        uv pip install zarr
+        uv pip install git+${GITHUB_PREFIX}https://github.com/facebookresearch/pytorch3d.git@v0.7.9  --no-build-isolation
+        uv pip install warp-lang==1.11.1
+        uv pip install git+${GITHUB_PREFIX}https://github.com/NVlabs/curobo.git  --no-build-isolation
+    else
+        # pytorch3d, curobo and warp-lang are CUDA source builds with no ROCm/NPU
+        # equivalent. RoboTwin guards both curobo (envs/robot/planner.py) and
+        # pytorch3d (envs/camera/camera.py) in try/except with working fallbacks,
+        # and warp is not referenced at all, so the env runs without them as long
+        # as planner_backend is mplib — which every RLinf robotwin config sets.
+        echo "[install.sh] ${PLATFORM}: skipping pytorch3d/curobo/warp-lang (CUDA-only); requires planner_backend=mplib."
+    fi
 
     # patch sapien and mplib for robotwin
     SAPIEN_LOCATION=$(uv pip show sapien | grep 'Location' | awk '{print $2}')/sapien

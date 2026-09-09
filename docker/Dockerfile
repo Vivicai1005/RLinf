@@ -29,11 +29,17 @@ ARG FRANKA_BASE_IMAGE=${REGISTRY_MIRROR}ubuntu:20.04
 FROM ${NVIDIA_BASE_IMAGE} AS base-image-platform-nvidia
 FROM ${AMD_BASE_IMAGE} AS base-image-platform-amd
 ARG ROCM_ARCHS
+ARG AMD_VULKAN_ICD_FILE
 ENV AMDGPU_TARGETS=${ROCM_ARCHS}
 ENV GPU_ARCHS=${ROCM_ARCHS}
 ENV HCC_AMDGPU_TARGET=${ROCM_ARCHS}
 ENV PYTORCH_ROCM_ARCH=${ROCM_ARCHS}
 ENV AMD_VISIBLE_DEVICES=all
+# RADV (the default Mesa ICD) only supports Radeon graphics parts; it refuses CDNA
+# accelerators with "device 'GFX940' is not supported by RADV", leaving Vulkan with
+# zero devices. On MI300/MI350 point this at lavapipe's ICD so SAPIEN can still
+# create a render device (CPU rasterization). Empty keeps the RADV default.
+ENV AMD_VULKAN_ICD_FILE=${AMD_VULKAN_ICD_FILE}
 FROM ${ASCEND_BASE_IMAGE} AS base-image-platform-ascend
 ENV ASCEND_VISIBLE_DEVICES=all
 FROM ${MUSA_BASE_IMAGE} AS base-image-platform-musa
@@ -109,9 +115,13 @@ RUN if [ "$NO_MIRROR" != "1" ]; then \
         fi; \
     fi
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git vim libibverbs-dev liblz4-dev libzstd-dev openssh-server sudo runit runit-systemd tmux \
+    git vim libibverbs-dev liblz4-dev libzstd-dev openssh-server sudo runit tmux \
     build-essential python3-dev cmake pkg-config iproute2 pciutils python3 python3-pip \
     wget unzip curl
+# runit-systemd is a 22.04-only transitional package; it was dropped in 24.04,
+# where runit alone is enough. Keep the build working on both.
+RUN apt-get install -y --no-install-recommends runit-systemd \
+    || echo "[Dockerfile] runit-systemd unavailable on this release; continuing with runit only"
 
 
 ##################################################################################################
@@ -133,8 +143,12 @@ RUN python3 -m pip install -i ${PIP_INDEX} --upgrade pip setuptools wheel uv
 ENV HF_HOME=/opt/.cache/huggingface
 RUN mkdir -p $HF_HOME
 
-ENV UV_PATH=/opt/venv
-RUN mkdir $UV_PATH
+# Overridable: some vendor base images already ship their own venv at /opt/venv
+# (e.g. the AMD ROCm images, where the ROCm SDK itself lives in site-packages).
+# Point UV_PATH elsewhere in that case so the two do not collide.
+ARG UV_PATH=/opt/venv
+ENV UV_PATH=${UV_PATH}
+RUN mkdir -p $UV_PATH
 WORKDIR $UV_PATH
 
 ENV UV_LINK_MODE=hardlink
@@ -381,16 +395,45 @@ RUN echo "source ${UV_PATH}/franka-0.15.0/bin/activate" >> ~/.bashrc
 ##################################################################################################
 FROM embodied-common-image AS embodied-robotwin-image
 
-# Install openvla-oft, openpi, and lingbotvla envs
-RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openvla-oft --model openvla-oft --env robotwin && \
-    bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi --model openpi --env robotwin && \
-    bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv lingbotvla --model lingbotvla --env robotwin
+# Install openvla-oft, openpi, and lingbotvla envs.
+# AMD supports the lingbotvla model only: openpi pins jax[cuda12] and openvla-oft
+# is not validated on ROCm.
+RUN if [ "${RLINF_PLATFORM}" = "amd" ]; then \
+        bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv lingbotvla --model lingbotvla --env robotwin; \
+    else \
+        bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openvla-oft --model openvla-oft --env robotwin && \
+        bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi --model openpi --env robotwin && \
+        bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv lingbotvla --model lingbotvla --env robotwin; \
+    fi
 
-RUN source switch_env openpi && download_assets ${INSTALL_MIRROR_OPTION} --dir /opt/assets --assets openpi
-RUN link_assets
+# openpi assets are only meaningful when the openpi venv exists.
+RUN if [ "${RLINF_PLATFORM}" != "amd" ]; then \
+        source switch_env openpi && download_assets ${INSTALL_MIRROR_OPTION} --dir /opt/assets --assets openpi && \
+        link_assets; \
+    fi
+
+# RoboTwin is not a pip package: it is a repo that has to be on PYTHONPATH.
+# On AMD, bake it in together with the shader patch, because the image is
+# unusable without that patch (RoboTwin's hardcoded ray tracer costs ~2.4 s per
+# 640x480 frame on the CPU rasterizer that CDNA forces us onto). Other platforms
+# keep the upstream behaviour of cloning RoboTwin themselves, where the
+# ray-traced default is both fast and what the released checkpoints expect.
+# Assets are multi-GB and stay a runtime concern (script/_download_assets.sh).
+ENV ROBOTWIN_PATH=/opt/envs/robotwin
+ENV ROBOT_PLATFORM=ALOHA
+RUN if [ "${RLINF_PLATFORM}" = "amd" ]; then \
+        git clone --depth 1 -b RLinf_support \
+            https://github.com/RoboTwin-Platform/RoboTwin.git ${ROBOTWIN_PATH} && \
+        python3 requirements/embodied/patch_robotwin_shader.py ${ROBOTWIN_PATH}/envs/_base_task.py && \
+        echo "export PYTHONPATH=${ROBOTWIN_PATH}:\$PYTHONPATH" >> ~/.bashrc; \
+    fi
 
 # Set default env
-RUN echo "source ${UV_PATH}/openvla-oft/bin/activate" >> ~/.bashrc
+RUN if [ "${RLINF_PLATFORM}" = "amd" ]; then \
+        echo "source ${UV_PATH}/lingbotvla/bin/activate" >> ~/.bashrc; \
+    else \
+        echo "source ${UV_PATH}/openvla-oft/bin/activate" >> ~/.bashrc; \
+    fi
 
 
 ##################################################################################################
