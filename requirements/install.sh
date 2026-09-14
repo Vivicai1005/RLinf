@@ -364,6 +364,20 @@ detect_rocm_version() {
     echo "$mm"
 }
 
+# Base URL for the PyTorch wheel indexes. --use-mirror points these at NJU,
+# whose index answers normally but whose package store (/pypi/web/packages) is
+# unreachable from some networks — a resolve then hangs until uv gives up. Set
+# TORCH_INDEX_BASE to redirect just these indexes, keeping the apt/pypi mirrors.
+torch_index_base() {
+    if [ -n "${TORCH_INDEX_BASE:-}" ]; then
+        printf '%s' "${TORCH_INDEX_BASE%/}"
+    elif [ "$USE_MIRRORS" -eq 1 ]; then
+        printf '%s' "https://mirrors.nju.edu.cn/pytorch"
+    else
+        printf '%s' "https://download.pytorch.org"
+    fi
+}
+
 # Find a torch version on the PyTorch wheel index that has a +rocm<rocm_ver>
 # Linux x86_64 wheel matching PYTHON_VERSION's cpXY tag. Prefers the smallest
 # version >= 2.5; falls back to the highest available wheel if no >= 2.5 wheel
@@ -379,8 +393,8 @@ detect_torch_for_rocm() {
     fi
 
     local url
-    if [ "$USE_MIRRORS" -eq 1 ]; then
-        url="https://mirrors.nju.edu.cn/pytorch/whl/rocm${rocm_ver}/torch/"
+    if [ -n "${TORCH_INDEX_BASE:-}" ] || [ "$USE_MIRRORS" -eq 1 ]; then
+        url="$(torch_index_base)/whl/rocm${rocm_ver}/torch/"
     else
         url="https://download.pytorch.org/whl/torch/"
     fi
@@ -618,11 +632,7 @@ configure_amd() {
     fi
 
     PLATFORM_TORCH_STR="+rocm${ROCM_VERSION}"
-    if [ "$USE_MIRRORS" -eq 1 ]; then
-        PLATFORM_TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/rocm${ROCM_VERSION}"
-    else
-        PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
-    fi
+    PLATFORM_TORCH_INDEX="$(torch_index_base)/whl/rocm${ROCM_VERSION}"
     # All four packages are routed through the ROCm index (and only that
     # index — see explicit=true on [[tool.uv.index]]). torchvision/torchaudio
     # arrive transitively via vllm/etc.; pytorch-triton-rocm arrives
@@ -692,11 +702,7 @@ EOF
     PLATFORM_TORCH_STR=""
     # torch is resolved but never installed; the CPU index keeps the multi-GB
     # nvidia-* CUDA wheels out of the resolution.
-    if [ "$USE_MIRRORS" -eq 1 ]; then
-        PLATFORM_TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/cpu"
-    else
-        PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/cpu"
-    fi
+    PLATFORM_TORCH_INDEX="$(torch_index_base)/whl/cpu"
     PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio")
     # Deliberately leave UV_TORCH_BACKEND unset. Forcing it to "cpu" makes uv
     # resolve torch==X+cpu, which does not match the seeded X+rocm... local

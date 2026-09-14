@@ -154,6 +154,12 @@ ENV INSTALL_MIRROR_OPTION=${INSTALL_MIRROR_OPTION:-"--use-mirror"}
 ENV HF_ENDPOINT=${NO_MIRROR:+"https://huggingface.co"}
 ENV HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 
+# The PyTorch wheel index is mirrored separately from pypi (see torch_index_base
+# in install.sh). Networks that reach the apt/pypi mirrors fine but stall on the
+# NJU package store can redirect just this one.
+ARG TORCH_INDEX_BASE=
+ENV TORCH_INDEX_BASE=${TORCH_INDEX_BASE}
+
 RUN pip config set global.index-url ${PIP_INDEX}
 RUN python3 -m pip install -i ${PIP_INDEX} --upgrade pip setuptools wheel uv
 
