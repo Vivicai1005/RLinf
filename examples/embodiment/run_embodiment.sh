@@ -59,6 +59,8 @@ EXTRA_OVERRIDES=""
 [ -n "${SAVE_INTER:-}" ] && [ "$SAVE_INTER" != "-2" ] && EXTRA_OVERRIDES+=" runner.save_interval=${SAVE_INTER}"
 [ -n "${NODES:-}" ]      && [ "$NODES"      != "-2" ] && EXTRA_OVERRIDES+=" cluster.num_nodes=${NODES}"
 
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}${EXTRA_OVERRIDES}"
+# Any arguments past the config name and robot platform are passed through to
+# hydra, so callers can override config keys without editing the YAML.
+CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}${EXTRA_OVERRIDES} ${*:3}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
