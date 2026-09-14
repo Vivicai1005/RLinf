@@ -19,7 +19,8 @@ Each `BUILD_TARGET` maps to a build stage in [`Dockerfile`](Dockerfile). To see 
 ### Additional build arguments
 
 - `PLATFORM` (default `nvidia`) — hardware platform: `nvidia` (CUDA), `amd` (ROCm), `ascend` (CANN), or `musa` (Moore Threads). Selects the base image and is also recorded as `RLINF_PLATFORM` in the final image. The `embodied-franka` target ignores `PLATFORM` and always uses a plain `ubuntu:20.04` base.
-- Per-platform runtime versions: `CUDA_VER`, `ROCM_VER`, `ROCM_ARCHS`, `CANN_VER`, `MUSA_VER`, `UBUNTU_VER`. Override any of these to bump versions without changing the rest of the build. For a fully custom base, set `NVIDIA_BASE_IMAGE`, `AMD_BASE_IMAGE`, `ASCEND_BASE_IMAGE`, or `MUSA_BASE_IMAGE` directly.
+- Per-platform runtime versions: `CUDA_VER`, `ROCM_VER`, `ROCM_ARCHS`, `ROCM_TORCH_VER`, `CANN_VER`, `MUSA_VER`, `UBUNTU_VER`, `AMD_UBUNTU_VER`. Override any of these to bump versions without changing the rest of the build. For a fully custom base, set `NVIDIA_BASE_IMAGE`, `AMD_BASE_IMAGE`, `ASCEND_BASE_IMAGE`, or `MUSA_BASE_IMAGE` directly.
+- `UV_PATH` — where RLinf's venvs are created. Defaults to `/opt/venv`, except on `PLATFORM=amd` where it is `/opt/rlinf-venv` because the ROCm base image already owns `/opt/venv`.
 - `NO_MIRROR` — set to `1` to skip the USTC apt/pypi mirror rewrites (recommended outside of mainland China).
 
 Example with non-default args:
@@ -32,6 +33,46 @@ docker build -f docker/Dockerfile \
     --build-arg NO_MIRROR=1 \
     -t rlinf:embodied-metaworld .
 ```
+
+### Building for AMD Radeon / ROCm
+
+`PLATFORM=amd` builds on `rocm/pytorch`, which already carries a torch built
+against the image's ROCm. `install.sh` reuses that build rather than resolving a
+wheel: the vendor local-version tag exists on no public index, and replacing
+torch would break the triton/flash-attn kernels compiled against it. Because
+those images own `/opt/venv`, RLinf's own venvs are placed in `/opt/rlinf-venv`
+instead.
+
+The defaults target RDNA3 (`gfx1100`: W7900/W7900D, RX 7900 XT(X)). Set
+`ROCM_ARCHS=gfx90a;gfx942` for CDNA (MI200/MI300) — that path additionally needs
+`AMD_VULKAN_ICD_FILE` pointed at lavapipe, since RADV refuses CDNA parts and
+SAPIEN would otherwise find no Vulkan device.
+
+`ROCM_VER` and `ROCM_TORCH_VER` together select the base image tag, so they have
+to name a tag that actually exists. Prefer a ROCm no newer than the host driver.
+
+```shell
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
+    --build-arg BUILD_TARGET=embodied-robotwin \
+    --build-arg PLATFORM=amd \
+    -t rlinf:embodied-robotwin-rocm .
+```
+
+Run it with the GPUs passed through. There is no `--gpus all` equivalent on
+ROCm; the KFD and DRI device nodes are handed over directly:
+
+```shell
+docker run -it --rm --ipc=host --shm-size=100g --network host \
+    --device /dev/kfd --device /dev/dri \
+    --group-add video --group-add render \
+    --security-opt seccomp=unconfined \
+    rlinf:embodied-robotwin-rocm bash
+```
+
+Only the `lingbotvla` venv is installed on AMD: `openpi` pins `jax[cuda12]`, and
+`openvla-oft` is not validated on ROCm. RoboTwin itself is baked into the image
+at `$ROBOTWIN_PATH`; its multi-GB assets are still a runtime download via
+`script/_download_assets.sh`.
 
 ### Building for Moore Threads (MUSA)
 

@@ -6,16 +6,28 @@ ARG PLATFORM=nvidia
 # Per-platform runtime versions. Override these for common CUDA/ROCm/CANN bumps, or
 # override the full base-image args below for a different image family/Ubuntu.
 ARG CUDA_VER=12.8.1
-ARG ROCM_VER=6.4
-ARG ROCM_ARCHS=gfx90a;gfx942
+ARG ROCM_VER=7.2.4
+# Radeon (RDNA3) defaults: gfx1100 covers W7900/W7900D and RX 7900 XT(X). Override
+# with gfx90a;gfx942 for CDNA (MI200/MI300), or gfx1200;gfx1201 for RDNA4.
+ARG ROCM_ARCHS=gfx1100
+# torch version baked into the ROCm base image below; install.sh reuses it instead
+# of resolving a wheel, so the two have to be kept in step.
+ARG ROCM_TORCH_VER=2.10.0
 ARG CANN_VER=9.0.0-910b
 ARG MUSA_VER=v2.1.5-musa4.3.7
 ARG UBUNTU_VER=22.04
+# The ROCm images track a different Ubuntu line than the CUDA ones, so they get
+# their own knob rather than sharing UBUNTU_VER.
+ARG AMD_UBUNTU_VER=24.04
 # Registry prefix for the Docker Hub base images, with a trailing slash.
 # Empty pulls from Docker Hub; set e.g. REGISTRY_MIRROR=m.daocloud.io/docker.io/ when it is unreachable.
 ARG REGISTRY_MIRROR=
 ARG NVIDIA_BASE_IMAGE=${REGISTRY_MIRROR}nvidia/cuda:${CUDA_VER}-cudnn-devel-ubuntu${UBUNTU_VER}
-ARG AMD_BASE_IMAGE=${REGISTRY_MIRROR}rocm/dev-ubuntu-${UBUNTU_VER}:${ROCM_VER}-complete
+# rocm/pytorch rather than rocm/dev-ubuntu: it ships a torch built against this
+# exact ROCm, and install.sh reuses that build rather than pulling a wheel whose
+# local version tag exists on no public index. rocm/dev-ubuntu-*-complete has the
+# ROCm stack but no torch, which forces the wheel-index path.
+ARG AMD_BASE_IMAGE=${REGISTRY_MIRROR}rocm/pytorch:rocm${ROCM_VER}_ubuntu${AMD_UBUNTU_VER}_py3.12_pytorch_release_${ROCM_TORCH_VER}
 # Ascend lives on Huawei SWR, not Docker Hub.
 ARG ASCEND_BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:${CANN_VER}-ubuntu${UBUNTU_VER}-py3.11
 # MUSA lives on the Moore Threads registry, not Docker Hub.
@@ -38,8 +50,13 @@ ENV AMD_VISIBLE_DEVICES=all
 # RADV (the default Mesa ICD) only supports Radeon graphics parts; it refuses CDNA
 # accelerators with "device 'GFX940' is not supported by RADV", leaving Vulkan with
 # zero devices. On MI300/MI350 point this at lavapipe's ICD so SAPIEN can still
-# create a render device (CPU rasterization). Empty keeps the RADV default.
+# create a render device (CPU rasterization). Empty keeps the RADV default, which
+# is what RDNA3 wants: RADV drives gfx1100 natively, so SAPIEN renders on the GPU
+# and none of the CPU-rasterizer workarounds below are needed.
 ENV AMD_VULKAN_ICD_FILE=${AMD_VULKAN_ICD_FILE}
+# The ROCm PyTorch images already own /opt/venv — torch, triton and the ROCm SDK
+# all live in it. Keep RLinf's venvs out of the way so the vendor build survives.
+ENV RLINF_UV_PATH_DEFAULT=/opt/rlinf-venv
 FROM ${ASCEND_BASE_IMAGE} AS base-image-platform-ascend
 ENV ASCEND_VISIBLE_DEVICES=all
 FROM ${MUSA_BASE_IMAGE} AS base-image-platform-musa
@@ -145,9 +162,11 @@ RUN mkdir -p $HF_HOME
 
 # Overridable: some vendor base images already ship their own venv at /opt/venv
 # (e.g. the AMD ROCm images, where the ROCm SDK itself lives in site-packages).
-# Point UV_PATH elsewhere in that case so the two do not collide.
-ARG UV_PATH=/opt/venv
-ENV UV_PATH=${UV_PATH}
+# Those set RLINF_UV_PATH_DEFAULT in their platform stage so the two do not
+# collide; an explicit --build-arg UV_PATH still wins over both.
+ARG UV_PATH=
+ENV UV_PATH=${UV_PATH:-${RLINF_UV_PATH_DEFAULT}}
+ENV UV_PATH=${UV_PATH:-/opt/venv}
 RUN mkdir -p $UV_PATH
 WORKDIR $UV_PATH
 
