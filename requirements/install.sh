@@ -721,11 +721,17 @@ EOF
     PLATFORM_TORCHCODEC_SPEC=""
     PLATFORM_EXTRA_OVERRIDES=()
 
+    # Resolve these but never write them into the venv: they are the image's own
+    # ROCm builds, or CUDA-only kernels that must not be pulled in. ray is
+    # deliberately absent — the musa path excludes it because that image ships it
+    # under --system-site-packages, but the ROCm images do not, and the bridge
+    # only covers what is actually there, so excluding it leaves rlinf.scheduler
+    # with no ray at all.
     PLATFORM_UV_SYNC_ARGS=("--inexact")
     local pkg
     for pkg in torch torchvision torchaudio torchcodec triton pytorch-triton-rocm \
         flash-attn deepspeed vllm sglang xgrammar liger-kernel transformer-engine \
-        torch-memory-saver apex ray; do
+        torch-memory-saver apex; do
         PLATFORM_UV_SYNC_ARGS+=("--no-install-package" "$pkg")
     done
 
@@ -1119,6 +1125,20 @@ install_amd_extras() {
             # shellcheck disable=SC2086
             uv pip uninstall $cuda_pkgs || true
         fi
+        # Ray's AMDGPUAcceleratorManager counts GPUs through amdsmi; without it
+        # it reports 0 and every placement string fails to resolve. The ROCm
+        # tree ships the bindings matching the image's ROCm, so install those
+        # rather than a PyPI amdsmi that has to be version-guessed.
+        local amdsmi_src="${ROCM_PATH:-/opt/rocm}/share/amd_smi"
+        if python -c "import amdsmi" >/dev/null 2>&1; then
+            echo "[install.sh] amd: amdsmi already importable."
+        elif [ -d "$amdsmi_src" ]; then
+            echo "[install.sh] amd: installing amdsmi from ${amdsmi_src} for Ray GPU detection"
+            uv pip install "$amdsmi_src"
+        else
+            echo "[install.sh] amd: ${amdsmi_src} not found; Ray may report 0 GPUs." >&2
+        fi
+
         # The image already provides a `triton` importable on ROCm; the shim
         # install below keys off pytorch-triton-rocm, which these images do not use.
         return 0
@@ -2535,6 +2555,14 @@ install_lingbot_vla_model() {
             exit 1
             ;;
     esac
+
+    # lingbot-vla hardcodes use_flash_attention_2 at every construction site and
+    # its vendored Qwen2.5-VL registers no sdpa, so targets without a flash-attn
+    # build (ROCm on RDNA3) are left with no working attention at all. Runs after
+    # install_flash_attn so it can no-op wherever flash-attn did install.
+    python3 "$SCRIPT_DIR/embodied/patch_lingbotvla_attn.py" \
+        --require-flash-attn "$lingbotvla_dir"
+
     uv pip uninstall pynvml || true
 }
 
