@@ -22,6 +22,7 @@ Each `BUILD_TARGET` maps to a build stage in [`Dockerfile`](Dockerfile). To see 
 - Per-platform runtime versions: `CUDA_VER`, `ROCM_VER`, `ROCM_ARCHS`, `ROCM_TORCH_VER`, `CANN_VER`, `MUSA_VER`, `UBUNTU_VER`, `AMD_UBUNTU_VER`. Override any of these to bump versions without changing the rest of the build. For a fully custom base, set `NVIDIA_BASE_IMAGE`, `AMD_BASE_IMAGE`, `ASCEND_BASE_IMAGE`, or `MUSA_BASE_IMAGE` directly.
 - `UV_PATH` — where RLinf's venvs are created. Defaults to `/opt/venv`, except on `PLATFORM=amd` where it is `/opt/rlinf-venv` because the ROCm base image already owns `/opt/venv`.
 - `NO_MIRROR` — set to `1` to skip the USTC apt/pypi mirror rewrites (recommended outside of mainland China).
+- `TORCH_INDEX_BASE` — base URL for the PyTorch wheel index, which is mirrored separately from pypi. Set it to `https://download.pytorch.org` on networks that reach the apt/pypi mirrors but stall on the NJU package store.
 
 Example with non-default args:
 
@@ -61,13 +62,22 @@ DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
 Run it with the GPUs passed through. There is no `--gpus all` equivalent on
 ROCm; the KFD and DRI device nodes are handed over directly:
 
+The groups are passed by GID rather than by name: `render` exists on the host
+but not inside the image, and `docker run` resolves `--group-add <name>` against
+the image's group file.
+
 ```shell
 docker run -it --rm --ipc=host --shm-size=100g --network host \
     --device /dev/kfd --device /dev/dri \
-    --group-add video --group-add render \
+    --group-add "$(getent group video | cut -d: -f3)" \
+    --group-add "$(getent group render | cut -d: -f3)" \
     --security-opt seccomp=unconfined \
+    -v "$PWD:/workspace/RLinf" -w /workspace/RLinf \
     rlinf:embodied-robotwin-rocm bash
 ```
+
+RLinf itself is not installed into the image — mount the repo as above and run
+from it. New shells activate the `lingbotvla` venv automatically.
 
 Only the `lingbotvla` venv is installed on AMD: `openpi` pins `jax[cuda12]`, and
 `openvla-oft` is not validated on ROCm. RoboTwin itself is baked into the image
