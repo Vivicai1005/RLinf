@@ -33,6 +33,14 @@ ARG ASCEND_BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:${CANN_VER
 # MUSA lives on the Moore Threads registry, not Docker Hub.
 ARG MUSA_BASE_IMAGE=registry.mthreads.com/mcctest/ai/training-suite:${MUSA_VER}
 ARG FRANKA_BASE_IMAGE=${REGISTRY_MIRROR}ubuntu:20.04
+# flash-attn on ROCm is a source build of its Triton backend against AITER's
+# kernels; see install_amd_triton_flash_attn in install.sh. Both are pinned by
+# commit because the Triton path carries no release tag. Defaults live in
+# install.sh; override here to move either pin without editing the script.
+ARG AMD_AITER_COMMIT=
+ARG AMD_FLASH_ATTN_REPO=
+ARG AMD_FLASH_ATTN_COMMIT=
+ARG AMD_FLASH_ATTN_VERSION=
 
 
 ##################################################################################################
@@ -47,6 +55,16 @@ ENV GPU_ARCHS=${ROCM_ARCHS}
 ENV HCC_AMDGPU_TARGET=${ROCM_ARCHS}
 ENV PYTORCH_ROCM_ARCH=${ROCM_ARCHS}
 ENV AMD_VISIBLE_DEVICES=all
+# Empty values fall through to install.sh's own defaults; ENV rather than ARG so
+# the derived build stages that actually run install.sh inherit them.
+ARG AMD_AITER_COMMIT
+ARG AMD_FLASH_ATTN_REPO
+ARG AMD_FLASH_ATTN_COMMIT
+ARG AMD_FLASH_ATTN_VERSION
+ENV AMD_AITER_COMMIT=${AMD_AITER_COMMIT}
+ENV AMD_FLASH_ATTN_REPO=${AMD_FLASH_ATTN_REPO}
+ENV AMD_FLASH_ATTN_COMMIT=${AMD_FLASH_ATTN_COMMIT}
+ENV AMD_FLASH_ATTN_VERSION=${AMD_FLASH_ATTN_VERSION}
 # RADV (the default Mesa ICD) only supports Radeon graphics parts; it refuses CDNA
 # accelerators with "device 'GFX940' is not supported by RADV", leaving Vulkan with
 # zero devices. On MI300/MI350 point this at lavapipe's ICD so SAPIEN can still

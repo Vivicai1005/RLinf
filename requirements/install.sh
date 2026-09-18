@@ -87,6 +87,24 @@ AMD_REUSE_IMAGE_TORCH=0
 # any venv is activated. Used by bridge_image_site_packages.
 IMAGE_PYTHON=""
 IMAGE_SITE_PACKAGES=""
+# flash-attn on ROCm comes from source, not a wheel: no published wheel targets
+# RDNA3, and the vendor rocm/pytorch images ship no flash-attn at all. Its
+# Triton backend does cover gfx1100 once AITER supplies the kernels, so
+# install_amd_triton_flash_attn builds AITER and flash-attn against the image's
+# torch. Both are pinned by commit because neither the Triton backend nor the
+# AITER kernels it needs are carried by a release tag.
+AMD_AITER_REPO="${AMD_AITER_REPO:-https://github.com/ROCm/aiter.git}"
+AMD_AITER_COMMIT="${AMD_AITER_COMMIT:-9bab8388c35936814a659b4ebd245c491e1b940a}"
+# A fork, not Dao-AILab: upstream's ROCm Triton path does not build for gfx1100.
+AMD_FLASH_ATTN_REPO="${AMD_FLASH_ATTN_REPO:-https://github.com/ZiguanWang/flash-attention.git}"
+AMD_FLASH_ATTN_COMMIT="${AMD_FLASH_ATTN_COMMIT:-bc76302fbb24c0158207978930db030ca1eca5ca}"
+# The version that commit reports, asserted after the build so a silently
+# different checkout fails the install rather than a later training run.
+AMD_FLASH_ATTN_VERSION="${AMD_FLASH_ATTN_VERSION:-2.8.4}"
+# Where AITER is checked out and built. It stays on disk because
+# `setup.py develop` leaves the package importable from the source tree, so
+# this path has to remain on PYTHONPATH at runtime.
+AMD_AITER_PATH="${AMD_AITER_PATH:-/opt/aiter}"
 # Default torch-backend per platform; user can override by exporting
 # UV_TORCH_BACKEND before invoking this script.
 DEFAULT_BACKEND_NVIDIA="auto"
@@ -674,6 +692,13 @@ set_amd_venv_exports() {
             "export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
         )
     fi
+    # flash-attn picks its backend at import: without these it looks for a CUDA
+    # kernel and raises on ROCm. AITER stays importable from its build tree.
+    PLATFORM_VENV_EXPORTS+=(
+        "export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE"
+        "export AITER_TRITON_ONLY=1"
+        "export PYTHONPATH=${AMD_AITER_PATH}\${PYTHONPATH:+:\$PYTHONPATH}"
+    )
 }
 
 # The image already provides torch (and usually flash-attn/triton/apex built
@@ -713,9 +738,11 @@ EOF
     AMD_REUSE_IMAGE_TORCH=1
 
     set_amd_venv_exports
-    # flash-attn/apex/triton in these images are ROCm source builds pinned to the
-    # vendor torch; rebuilding them is slow and would link against the wrong ABI.
-    PLATFORM_FLASH_ATTN_INSTALL=0
+    # apex and triton in these images are ROCm source builds pinned to the vendor
+    # torch, so they are left alone. flash-attn is not in them at all, and no
+    # published wheel targets ROCm, so install_flash_attn builds it from source
+    # against this torch; PREBUILT=0 keeps the wheel lookup out of the picture.
+    PLATFORM_FLASH_ATTN_INSTALL=1
     PLATFORM_FLASH_ATTN_PREBUILT=0
     PLATFORM_RELAX_TORCHCODEC=1
     PLATFORM_TORCHCODEC_SPEC=""
@@ -1693,6 +1720,74 @@ EOF
     uv sync --active "${PLATFORM_UV_SYNC_ARGS[@]}" $NO_INSTALL_RLINF_CMD
 }
 
+# Shallow-fetch a single pinned commit. Cheaper than cloning AITER's full
+# history, and it keeps the pin in one place so a moved branch cannot change
+# what gets built.
+fetch_pinned_repo() {
+    local dir="$1" url="$2" commit="$3"
+
+    if [ -d "$dir/.git" ] && [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$commit" ]; then
+        echo "[install.sh] reusing ${dir} at ${commit}"
+        return 0
+    fi
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git init -q "$dir"
+    git -C "$dir" remote add origin "${GITHUB_PREFIX}${url}"
+    git -C "$dir" fetch -q --depth 1 origin "$commit"
+    git -C "$dir" checkout -q FETCH_HEAD
+}
+
+# Build flash-attn's Triton backend, plus the AITER kernels it calls, against
+# the torch already in the image. Runs inside the activated venv so both land
+# next to that torch rather than a resolved wheel.
+install_amd_triton_flash_attn() {
+    local archs="${GPU_ARCHS:-${PYTORCH_ROCM_ARCH:-gfx1100}}"
+
+    echo "[install.sh] amd: building AITER for GPU_ARCHS=${archs}"
+    fetch_pinned_repo "$AMD_AITER_PATH" "$AMD_AITER_REPO" "$AMD_AITER_COMMIT"
+    # flydsl is a dev-build pin published on no index, and AITER_TRITON_ONLY
+    # never reaches the code that imports it.
+    sed -i '/flydsl==0.1.9.dev599/d' "$AMD_AITER_PATH/pyproject.toml"
+    # develop, not a wheel build: AITER resolves its Triton kernel sources
+    # relative to the checkout, so the tree stays the import location.
+    ( cd "$AMD_AITER_PATH" \
+        && AITER_TRITON_ONLY=1 \
+           AITER_USE_SYSTEM_TRITON=1 \
+           GPU_ARCHS="$archs" \
+           python setup.py develop )
+
+    echo "[install.sh] amd: building flash-attn ${AMD_FLASH_ATTN_VERSION} (Triton backend)"
+    local fa_dir="$VENV_DIR/flash-attention"
+    fetch_pinned_repo "$fa_dir" "$AMD_FLASH_ATTN_REPO" "$AMD_FLASH_ATTN_COMMIT"
+    # --no-deps: its metadata asks for a torch that would replace the image's.
+    ( cd "$fa_dir" \
+        && AITER_TRITON_ONLY=1 \
+           GPU_ARCHS="$archs" \
+           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+           FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE \
+           PYTHONPATH="$AMD_AITER_PATH${PYTHONPATH:+:$PYTHONPATH}" \
+           uv pip install --no-build-isolation --no-deps . )
+    rm -rf "$fa_dir"
+
+    PYTHONPATH="$AMD_AITER_PATH${PYTHONPATH:+:$PYTHONPATH}" \
+    AITER_TRITON_ONLY=1 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+        python - "$AMD_FLASH_ATTN_VERSION" <<'EOF'
+import sys
+from importlib.metadata import version
+
+import aiter  # noqa: F401
+import flash_attn  # noqa: F401
+import triton
+
+expected = sys.argv[1]
+found = version("flash-attn")
+if found != expected:
+    raise SystemExit(f"flash-attn {found} installed, expected {expected}")
+print(f"[install.sh] amd: flash-attn {found}, AITER {version('amd-aiter')}, triton {triton.__version__}")
+EOF
+}
+
 install_flash_attn() {
     local flash_ver="2.7.4.post1"
 
@@ -1702,6 +1797,10 @@ install_flash_attn() {
     fi
     if [ "$PLATFORM_FLASH_ATTN_INSTALL" -ne 1 ]; then
         echo "[install.sh] flash-attn is unsupported on platform=${PLATFORM}; skipping install."
+        return 0
+    fi
+    if [ "$PLATFORM" = "amd" ]; then
+        install_amd_triton_flash_attn
         return 0
     fi
 
@@ -2555,13 +2654,6 @@ install_lingbot_vla_model() {
             exit 1
             ;;
     esac
-
-    # lingbot-vla hardcodes use_flash_attention_2 at every construction site and
-    # its vendored Qwen2.5-VL registers no sdpa, so targets without a flash-attn
-    # build (ROCm on RDNA3) are left with no working attention at all. Runs after
-    # install_flash_attn so it can no-op wherever flash-attn did install.
-    python3 "$SCRIPT_DIR/embodied/patch_lingbotvla_attn.py" \
-        --require-flash-attn "$lingbotvla_dir"
 
     uv pip uninstall pynvml || true
 }

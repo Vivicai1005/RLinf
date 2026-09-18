@@ -94,6 +94,7 @@ install_deps_apt() {
         unzip \
         curl \
         cmake \
+        ninja-build \
         patchelf \
         git-lfs \
         lsb-release \

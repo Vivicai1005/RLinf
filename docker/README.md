@@ -40,14 +40,27 @@ docker build -f docker/Dockerfile \
 `PLATFORM=amd` builds on `rocm/pytorch`, which already carries a torch built
 against the image's ROCm. `install.sh` reuses that build rather than resolving a
 wheel: the vendor local-version tag exists on no public index, and replacing
-torch would break the triton/flash-attn kernels compiled against it. Because
-those images own `/opt/venv`, RLinf's own venvs are placed in `/opt/rlinf-venv`
+torch would break the triton and apex kernels compiled against it. Because those
+images own `/opt/venv`, RLinf's own venvs are placed in `/opt/rlinf-venv`
 instead.
 
 The defaults target RDNA3 (`gfx1100`: W7900/W7900D, RX 7900 XT(X)). Set
 `ROCM_ARCHS=gfx90a;gfx942` for CDNA (MI200/MI300) — that path additionally needs
 `AMD_VULKAN_ICD_FILE` pointed at lavapipe, since RADV refuses CDNA parts and
 SAPIEN would otherwise find no Vulkan device.
+
+flash-attn is the one kernel the image does not supply in a usable form, and no
+published wheel targets ROCm. `install.sh` therefore builds it from source, via
+the Triton backend rather than a CUDA or CK kernel, together with the AITER
+kernels that backend calls. Both are pinned by commit, since neither carries a
+release tag that covers the Triton path; `AMD_AITER_COMMIT`,
+`AMD_FLASH_ATTN_REPO`, `AMD_FLASH_ATTN_COMMIT`, and `AMD_FLASH_ATTN_VERSION`
+move the pins without editing the script. The build honours `ROCM_ARCHS`, so it
+produces kernels for whatever architecture the rest of the image targets, and it
+asserts the resulting `flash-attn` version so a moved pin fails the build instead
+of a later training run. AITER stays importable from its build tree at
+`/opt/aiter`, which is why the venv exports `PYTHONPATH`,
+`FLASH_ATTENTION_TRITON_AMD_ENABLE`, and `AITER_TRITON_ONLY` on activation.
 
 `ROCM_VER` and `ROCM_TORCH_VER` together select the base image tag, so they have
 to name a tag that actually exists. Prefer a ROCm no newer than the host driver.
@@ -56,7 +69,14 @@ to name a tag that actually exists. Prefer a ROCm no newer than the host driver.
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
     --build-arg BUILD_TARGET=embodied-robotwin \
     --build-arg PLATFORM=amd \
-    -t rlinf:embodied-robotwin-rocm .
+    -t rlinf/rlinf:agentic-rlinf0.4-robotwin .
+```
+
+Networks that cannot reach Docker Hub need a prefix for the base image; the
+trailing slash is required:
+
+```shell
+    --build-arg REGISTRY_MIRROR=docker.m.daocloud.io/
 ```
 
 Run it with the GPUs passed through. There is no `--gpus all` equivalent on
@@ -73,7 +93,7 @@ docker run -it --rm --ipc=host --shm-size=100g --network host \
     --group-add "$(getent group render | cut -d: -f3)" \
     --security-opt seccomp=unconfined \
     -v "$PWD:/workspace/RLinf" -w /workspace/RLinf \
-    rlinf:embodied-robotwin-rocm bash
+    rlinf/rlinf:agentic-rlinf0.4-robotwin bash
 ```
 
 RLinf itself is not installed into the image — mount the repo as above and run
@@ -83,6 +103,25 @@ Only the `lingbotvla` venv is installed on AMD: `openpi` pins `jax[cuda12]`, and
 `openvla-oft` is not validated on ROCm. RoboTwin itself is baked into the image
 at `$ROBOTWIN_PATH`; its multi-GB assets are still a runtime download via
 `script/_download_assets.sh`.
+
+Checkpoints and assets are large enough to belong on a data disk rather than in
+the image. Mount that disk and point the RoboTwin configs at it — they read
+every path from the environment, so no YAML needs editing:
+
+```shell
+docker run -it --rm --ipc=host --shm-size=100g --network host \
+    --device /dev/kfd --device /dev/dri \
+    --group-add "$(getent group video | cut -d: -f3)" \
+    --group-add "$(getent group render | cut -d: -f3)" \
+    --security-opt seccomp=unconfined \
+    -v "$PWD:/workspace/RLinf" -w /workspace/RLinf \
+    -v /disk/ssd1/rlinf:/data \
+    -e LINGBOT_SFT_MODEL_PATH=/data/models/lingbot-vla-4b-posttrain-robotwin \
+    -e LINGBOT_VLA_CONFIG_PATH=/data/models/lingbot-vla-4b \
+    -e QWEN_VL_MODEL_PATH=/data/models/Qwen2.5-VL-3B-Instruct \
+    -e ROBOTWIN_ASSETS_PATH=/data/robotwin-assets \
+    rlinf/rlinf:agentic-rlinf0.4-robotwin bash
+```
 
 ### Building for Moore Threads (MUSA)
 
