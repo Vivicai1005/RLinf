@@ -178,6 +178,12 @@ ENV HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 ARG TORCH_INDEX_BASE=
 ENV TORCH_INDEX_BASE=${TORCH_INDEX_BASE}
 
+# GitHub is mirrored separately from apt/pypi too. Set GITHUB_PREFIX=none on
+# networks that reach github.com directly but truncate large clones through the
+# proxy; any other value, including the empty default, keeps the proxy.
+ARG GITHUB_PREFIX=
+ENV GITHUB_PREFIX=${GITHUB_PREFIX}
+
 RUN pip config set global.index-url ${PIP_INDEX}
 RUN python3 -m pip install -i ${PIP_INDEX} --upgrade pip setuptools wheel uv
 

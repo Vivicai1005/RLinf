@@ -121,7 +121,9 @@ TEST_BUILD=${TEST_BUILD:-0}
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 USE_MIRRORS=0
-GITHUB_PREFIX=""
+# Inherited from the environment when set, so a caller (e.g. a Docker build arg)
+# can redirect or disable the GitHub mirror; see setup_mirror.
+GITHUB_PREFIX="${GITHUB_PREFIX:-}"
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
@@ -1622,16 +1624,23 @@ setup_mirror() {
     remove_stale_github_mirror_rule
     if [ "$USE_MIRRORS" -eq 1 ]; then
         export USE_MIRRORS
+        # GITHUB_PREFIX=none keeps git and GitHub release downloads on github.com
+        # while pypi and Hugging Face stay mirrored. Networks that reach GitHub
+        # directly but truncate a large clone through the proxy need that; any
+        # other value, including unset, keeps the proxy.
         export GITHUB_PREFIX="${GITHUB_PREFIX:-https://gh-proxy.com/}"
+        [ "$GITHUB_PREFIX" = "none" ] && GITHUB_PREFIX=""
         export UV_PYTHON_INSTALL_MIRROR=${GITHUB_PREFIX}https://github.com/astral-sh/python-build-standalone/releases/download
         export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
         export HF_ENDPOINT=https://hf-mirror.com
-        # Scope the GitHub rewrite to this process and its children through git's
-        # environment config, so no global state is left behind on any exit path.
-        local idx="${GIT_CONFIG_COUNT:-0}"
-        export "GIT_CONFIG_KEY_${idx}=url.${GITHUB_PREFIX}github.com/.insteadOf"
-        export "GIT_CONFIG_VALUE_${idx}=https://github.com/"
-        export GIT_CONFIG_COUNT=$((idx + 1))
+        if [ -n "$GITHUB_PREFIX" ]; then
+            # Scope the GitHub rewrite to this process and its children through git's
+            # environment config, so no global state is left behind on any exit path.
+            local idx="${GIT_CONFIG_COUNT:-0}"
+            export "GIT_CONFIG_KEY_${idx}=url.${GITHUB_PREFIX}github.com/.insteadOf"
+            export "GIT_CONFIG_VALUE_${idx}=https://github.com/"
+            export GIT_CONFIG_COUNT=$((idx + 1))
+        fi
     fi
 }
 
@@ -2041,7 +2050,7 @@ clone_or_reuse_repo() {
         target_dir="$env_value"
         if [ ! -d "$target_dir" ]; then
             echo "$env_var_name=$target_dir does not exist yet; cloning $git_url into it..." >&2
-            git clone "$@" "$git_url" "$target_dir" >&2
+            retry_cmd git clone "$@" "$git_url" "$target_dir" >&2
         else
             echo "Reusing existing checkout at $env_var_name=$target_dir." >&2
             local want_ref="" prev="" arg current_ref
@@ -2059,7 +2068,7 @@ clone_or_reuse_repo() {
     else
         target_dir="$default_dir"
         if [ ! -d "$target_dir" ]; then
-            git clone "$@" "$git_url" "$target_dir" >&2
+            retry_cmd git clone "$@" "$git_url" "$target_dir" >&2
         elif [ -d "$target_dir/.git" ]; then
             echo "Checking git repo $target_dir..." >&2
             local git_intact=1
@@ -2069,7 +2078,7 @@ clone_or_reuse_repo() {
             else
                 echo "Git repo $target_dir is corrupted. Re-cloning..." >&2
                 rm -rf "$target_dir"
-                git clone "$@" "$git_url" "$target_dir" >&2
+                retry_cmd git clone "$@" "$git_url" "$target_dir" >&2
             fi
         fi
     fi
