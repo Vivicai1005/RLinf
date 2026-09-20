@@ -165,5 +165,6 @@ Open a model page for the full workflow and its supported environments.
    StarVLA <embodied/starvla>
    MolmoAct2 <embodied/molmoact2>
    Lingbot-VLA <embodied/lingbotvla>
+   Lingbot-VLA on ROCm <embodied/rocm_lingbotvla>
    Evo-1 <embodied/evo1>
    ABot-M0 <embodied/abot_m0>
