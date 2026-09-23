@@ -1,6 +1,6 @@
 # [Roadmap] RLinf on AMD ROCm 
 
-## Benchmarks for Embodied AI
+## Embodied AI
 
 #### RoboTwin (Radeon PRO W7900 (`gfx1100`), 1 node × 8 GPUs)
 - [ ] **P0** - Publish the ROCm RoboTwin image. The `embodied-robotwin` stage
