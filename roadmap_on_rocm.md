@@ -3,11 +3,11 @@
 ## Embodied AI
 
 #### RoboTwin 2.0 — Radeon PRO W7900 (gfx1100, 1 node × 8 GPUs) — P0
-- [ ] Publish a ROCm RoboTwin Docker image and update the deployment documentation.
 - [ ] Validate OpenVLA-OFT + GRPO training and accuracy on representative RoboTwin tasks.
 - [ ] Enable Lingbot-VLA + GRPO fine-tuning on ROCm.
-- [ ] Add RoboTwin ROCm CI coverage.
 - [ ] Enable PPO fine-tuning of π₀ and π₀.₅ on ROCm.
+- [ ] Publish a ROCm RoboTwin Docker image and update the deployment documentation.
+- [ ] Add RoboTwin ROCm CI coverage.
 
 #### LIBERO — Instinct MI300 (gfx942) · Radeon PRO W7900 (gfx1100), 1 node × 8 GPUs — P1
 - [ ] Validate the existing ROCm LIBERO Docker image on both Instinct MI300 and Radeon PRO W7900.
