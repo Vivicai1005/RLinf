@@ -4960,3 +4960,67 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
     assert selected_seed_0 == selected_seed_0_again
     assert selected_seed_0 != selected_seed_1
+
+
+def _load_robotwin_camera_patch():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "requirements"
+        / "embodied"
+        / "patch_robotwin_camera_near.py"
+    )
+    spec = importlib.util.spec_from_file_location("patch_robotwin_camera_near", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_robotwin_camera(tmp_path, near_line="        near, far = 0.1, 100\n"):
+    camera = tmp_path / "envs" / "camera" / "camera.py"
+    camera.parent.mkdir(parents=True)
+    camera.write_text(
+        "import sapien.core as sapien\n"
+        "import os\n"
+        "\n"
+        "class Camera:\n"
+        "    def load_camera(self, scene):\n"
+        f"{near_line}"
+        "        return near, far\n"
+    )
+    return camera
+
+
+def test_robotwin_camera_patch_reads_the_near_plane_from_the_environment(
+    tmp_path, monkeypatch
+):
+    patch = _load_robotwin_camera_patch()
+    camera = _fake_robotwin_camera(tmp_path)
+
+    assert patch.patch_robotwin(str(tmp_path)) is True
+
+    namespace = {}
+    exec(camera.read_text(), namespace)
+    monkeypatch.delenv("ROBOTWIN_CAMERA_NEAR", raising=False)
+    assert namespace["Camera"]().load_camera(None) == (0.01, 100)
+    monkeypatch.setenv("ROBOTWIN_CAMERA_NEAR", "0.1")
+    assert namespace["Camera"]().load_camera(None) == (0.1, 100)
+
+
+def test_robotwin_camera_patch_is_idempotent(tmp_path):
+    patch = _load_robotwin_camera_patch()
+    camera = _fake_robotwin_camera(tmp_path)
+    patch.patch_robotwin(str(tmp_path))
+    patched = camera.read_text()
+
+    assert patch.patch_robotwin(str(tmp_path)) is False
+    assert camera.read_text() == patched
+
+
+def test_robotwin_camera_patch_refuses_unknown_robotwin_code(tmp_path):
+    patch = _load_robotwin_camera_patch()
+    camera = _fake_robotwin_camera(tmp_path, near_line="        near, far = 0.05, 50\n")
+    original = camera.read_text()
+
+    with pytest.raises(RuntimeError, match="RoboTwin has changed"):
+        patch.patch_robotwin(str(tmp_path))
+    assert camera.read_text() == original

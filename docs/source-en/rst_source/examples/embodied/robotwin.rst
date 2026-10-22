@@ -277,7 +277,7 @@ Run on Different Hardware Backends
 ----------------------------------
 
 NVIDIA uses the installation and launch above. RoboTwin also installs on AMD
-ROCm, with one change to the task config.
+ROCm, with one change to the task config and one to the RoboTwin checkout.
 
 AMD ROCm
 ~~~~~~~~
@@ -302,6 +302,17 @@ the same command:
 .. code:: bash
 
    bash examples/embodiment/run_embodiment.sh robotwin_adjust_bottle_ppo_openpi_pi05
+
+Patch the RoboTwin checkout once after cloning it:
+
+.. code:: bash
+
+   python requirements/embodied/patch_robotwin_camera_near.py /path/to/RoboTwin
+
+RoboTwin's cameras use a 0.1 m near plane, and the SAPIEN 3.0.1 that RLinf
+installs clips everything closer than that, so the gripper fingers disappear from
+the wrist cameras. The patch lowers the near plane to 0.01 m; set
+``ROBOTWIN_CAMERA_NEAR`` to choose another value.
 
 RLinf publishes no ROCm RoboTwin image, so the Docker steps above apply to CUDA
 hosts only.

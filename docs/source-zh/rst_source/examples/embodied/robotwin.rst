@@ -272,7 +272,7 @@ RoboTwin 支持 46 个操作任务。RLinf 提供了以下 ready-to-run 环境�
 在不同硬件后端上运行
 ----------------------------------------
 
-NVIDIA 使用上面的安装与启动方式。RoboTwin 同样可以安装在 AMD ROCm 上，只需修改 task config 中的一项设置。
+NVIDIA 使用上面的安装与启动方式。RoboTwin 同样可以安装在 AMD ROCm 上，只需修改 task config 中的一项设置，并给 RoboTwin 代码打一个补丁。
 
 AMD ROCm
 ~~~~~~~~~~~~~~~~~~~~
@@ -291,6 +291,14 @@ AMD ROCm
 .. code:: bash
 
    bash examples/embodiment/run_embodiment.sh robotwin_adjust_bottle_ppo_openpi_pi05
+
+克隆 RoboTwin 后，对其代码执行一次补丁：
+
+.. code:: bash
+
+   python requirements/embodied/patch_robotwin_camera_near.py /path/to/RoboTwin
+
+RoboTwin 的相机近裁剪面为 0.1 m，而 RLinf 安装的 SAPIEN 3.0.1 会裁掉比它更近的物体，导致腕部相机中看不到夹爪手指。该补丁把近裁剪面降到 0.01 m；可通过 ``ROBOTWIN_CAMERA_NEAR`` 设置其他值。
 
 RLinf 未发布 ROCm 版 RoboTwin 镜像，因此上面的 Docker 步骤仅适用于 CUDA 宿主机。
 
